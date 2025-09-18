@@ -1,4 +1,4 @@
-<img width="881" height="281" alt="image" src="https://github.com/user-attachments/assets/e3faa656-57b2-4fee-9898-a2e7995833f6" /># 🎥 Focus & Object Detection in Video Interviews
+# 🎥 Focus & Object Detection in Video Interviews
 
 A lightweight **AI-powered video proctoring system** built with **TensorFlow.js, BlazeFace, and COCO-SSD**.  
 It helps interviewers monitor candidates in real-time during online interviews by detecting focus and unauthorized objects.
