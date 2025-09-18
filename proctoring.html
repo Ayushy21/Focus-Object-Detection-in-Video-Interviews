@@ -1,0 +1,303 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Proctoring — BlazeFace + COCO-SSD</title>
+
+  <!-- Tailwind + font -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
+
+  <style>
+    body { font-family: 'Inter', sans-serif; background:#1a202c; color:#e2e8f0; }
+    #video-container { position:relative; max-width:900px; margin:0 auto; border-radius:12px; overflow:hidden; }
+    video, canvas { width:100%; height:auto; display:block; border-radius:12px; }
+    canvas { position:absolute; top:0; left:0; z-index:10; pointer-events:none; }
+    .report-section { background:#2d3748; border-radius:12px; padding:1.25rem; }
+    .log-entry { border-bottom:1px solid #4a5568; padding:0.6rem 0; }
+  </style>
+
+  <!-- Pin TFJS to compatible version -->
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@3.21.0/dist/tf.min.js"></script>
+
+  <!-- BlazeFace (face detection) -->
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/blazeface@0.0.7/dist/blazeface.min.js"></script>
+
+  <!-- COCO-SSD for object detection -->
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd@2.2.2/dist/coco-ssd.min.js"></script>
+
+  <!-- Tone.js for audio alerts (optional) -->
+  <script src="https://cdn.jsdelivr.net/npm/tone@14.7.58/build/Tone.js"></script>
+</head>
+<body class="p-6">
+
+  <div class="container mx-auto max-w-7xl">
+    <h1 class="text-3xl font-bold text-center mb-8">Video Interview Proctoring (BlazeFace)</h1>
+
+    <div class="grid grid-cols-1 md:grid-cols-2 gap-8">
+      <div>
+        <div id="video-container" class="mb-4">
+          <video id="video" autoplay playsinline muted></video>
+          <canvas id="canvas"></canvas>
+        </div>
+
+        <div id="status" class="text-center font-semibold text-lg text-yellow-400 mb-4">
+          <span id="system-status">Initializing...</span>
+        </div>
+
+        <div class="flex flex-col sm:flex-row gap-4 mb-8">
+          <button id="startButton" class="w-full bg-blue-600 hover:bg-blue-700 text-white font-bold py-2 px-4 rounded-lg" disabled>Start Proctoring</button>
+          <button id="stopButton" class="w-full bg-red-600 hover:bg-red-700 text-white font-bold py-2 px-4 rounded-lg" disabled>End Interview & Report</button>
+        </div>
+      </div>
+
+      <div class="space-y-8">
+        <div class="report-section">
+          <h2 class="text-2xl font-semibold mb-4">Real-time Events</h2>
+          <div id="log-container" class="h-64 overflow-y-auto bg-gray-700 p-4 rounded-lg text-sm">
+            <p class="text-gray-400">Logs will appear here...</p>
+          </div>
+        </div>
+
+        <div id="proctoring-report" class="report-section hidden">
+          <h2 class="text-2xl font-semibold mb-4">Proctoring Report</h2>
+          <div id="report-details" class="space-y-2 text-sm"></div>
+          <div class="text-center mt-4">
+            <button onclick="window.print()" class="bg-gray-600 hover:bg-gray-700 text-white font-bold py-2 px-4 rounded-lg">Print Report</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+<script>
+/*
+  Uses:
+   - tfjs 3.21.0
+   - blazeface for face detection
+   - coco-ssd for object detection
+  Heuristics:
+   - If no face detected -> Suspicious (rate-limited)
+   - If multiple faces -> Suspicious
+   - If face centroid deviates from center (heuristic) -> Alert (looking away)
+   - Object detection flags phones/books/laptops
+*/
+
+let video, canvas, ctx;
+let blazeModel = null, cocoModel = null;
+let interviewRunning = false;
+let eventLog = [];
+let startTime = null;
+let busy = false;
+const lastEventTimes = {};
+const synth = new Tone.Synth().toDestination(); // may require gesture
+
+const startButton = document.getElementById('startButton');
+const stopButton  = document.getElementById('stopButton');
+const systemStatus = document.getElementById('system-status');
+const logContainer = document.getElementById('log-container');
+const proctoringReport = document.getElementById('proctoring-report');
+const reportDetails = document.getElementById('report-details');
+
+function nowSec() { return Date.now() / 1000; }
+function canLog(key, cooldown=5) {
+  const last = lastEventTimes[key] || 0;
+  if (nowSec() - last < cooldown) return false;
+  lastEventTimes[key] = nowSec();
+  return true;
+}
+
+function logEvent(type, message) {
+  const ts = new Date().toLocaleString();
+  eventLog.push({ timestamp: ts, type, message });
+  const el = document.createElement('div');
+  el.className = 'log-entry';
+  el.innerHTML = `<span class="text-gray-400">[${ts}]</span> <span class="font-bold text-yellow-300 mr-2">${type}:</span> <span class="text-white">${message}</span>`;
+  logContainer.prepend(el);
+  if (logContainer.children.length > 250) logContainer.lastChild.remove();
+  if (type === 'Suspicious' && canLog('audioAlert', 3)) {
+    try { synth.triggerAttackRelease('C4', '8n'); } catch(e) {}
+  }
+}
+
+function drawBox(x,y,w,h,label,color='#f56565') {
+  ctx.beginPath(); ctx.lineWidth = 2; ctx.strokeStyle = color; ctx.rect(x,y,w,h); ctx.stroke();
+  if (label) { ctx.font = '16px Inter, sans-serif'; ctx.fillStyle = color; ctx.fillText(label, x+6, Math.max(16, y-6)); }
+}
+
+function centroidOfBox(box) {
+  // box: [x, y, w, h]
+  return { x: box[0] + box[2]/2, y: box[1] + box[3]/2 };
+}
+
+// Main detection loop
+async function detectLoop() {
+  if (!interviewRunning) return;
+  if (busy) { requestAnimationFrame(detectLoop); return; }
+  if (video.readyState < 2) { requestAnimationFrame(detectLoop); return; }
+
+  busy = true;
+  try {
+    // match canvas to video size
+    if (canvas.width !== video.videoWidth || canvas.height !== video.videoHeight) {
+      canvas.width = video.videoWidth; canvas.height = video.videoHeight;
+    }
+
+    // draw mirrored video
+    ctx.save();
+    ctx.scale(-1,1);
+    ctx.drawImage(video, -canvas.width, 0, canvas.width, canvas.height);
+    ctx.restore();
+
+    // FACE detection using BlazeFace
+    let faces = [];
+    try {
+      // estimateFaces returns array of predictions with topLeft/bottomRight or probability
+      faces = await blazeModel.estimateFaces(video, false); // returnTensors=false
+    } catch(e) {
+      // fallback to canvas input
+      try { faces = await blazeModel.estimateFaces(canvas, false); } catch(err) { faces = []; }
+    }
+
+    if (!faces || faces.length === 0) {
+      if (canLog('no_face', 10)) logEvent('Suspicious', 'No face detected for an extended period.');
+    } else {
+      // reset no_face timer conceptually
+      lastEventTimes['no_face'] = 0;
+
+      if (faces.length > 1 && canLog('multiple_faces', 10)) {
+        logEvent('Suspicious', 'Multiple faces detected in frame.');
+      }
+
+      // use primary face (first)
+      const primary = faces[0];
+      // BlazeFace geometry: topLeft [x,y], bottomRight [x,y], probability
+      const tl = primary.topLeft;
+      const br = primary.bottomRight;
+      const box = [tl[0], tl[1], br[0] - tl[0], br[1] - tl[1]];
+      const cent = centroidOfBox(box);
+
+      // draw box (flip horizontally)
+      drawBox(canvas.width - box[0] - box[2], box[1], box[2], box[3], 'face');
+
+      // centroid dot
+      ctx.fillStyle = 'lime';
+      ctx.beginPath();
+      ctx.arc(canvas.width - cent.x, cent.y, 4, 0, Math.PI*2);
+      ctx.fill();
+
+      // heuristic: if centroid far from center -> looking away
+      const deviationX = Math.abs(cent.x - canvas.width/2);
+      const threshold = canvas.width * 0.18;
+      if (deviationX > threshold) {
+        if (canLog('looking_away', 5)) logEvent('Alert', 'Candidate likely looking away from screen (>5s heuristic).');
+      }
+    }
+
+    // OBJECT detection using coco-ssd
+    try {
+      const preds = await cocoModel.detect(video);
+      for (const p of preds) {
+        const cls = (p.class || '').toLowerCase();
+        const score = Math.round((p.score || 0) * 100);
+        if (['cell phone','cellphone','phone','book','laptop','book','notebook','paper'].includes(cls) && score > 65) {
+          if (canLog('item_' + cls, 6)) logEvent('Suspicious', `${p.class} detected with ${score}% confidence.`);
+          const [x,y,w,h] = p.bbox;
+          drawBox(canvas.width - x - w, y, w, h, `${p.class} (${score}%)`);
+        }
+      }
+    } catch(e) {
+      // ignore object errors
+    }
+
+  } finally {
+    busy = false;
+    requestAnimationFrame(detectLoop);
+  }
+}
+
+// Initialize everything
+async function init() {
+  systemStatus.textContent = 'Loading models...';
+  try {
+    // load models
+    blazeModel = await blazeface.load();
+    cocoModel = await cocoSsd.load();
+
+    systemStatus.textContent = 'Accessing camera...';
+    const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user' }, audio: false });
+    video = document.getElementById('video');
+    canvas = document.getElementById('canvas');
+    ctx = canvas.getContext('2d');
+    video.srcObject = stream;
+    await new Promise(resolve => video.onloadedmetadata = resolve);
+    canvas.width = video.videoWidth; canvas.height = video.videoHeight;
+
+    systemStatus.textContent = 'Ready — press Start';
+    startButton.disabled = false;
+  } catch (err) {
+    console.error('Error loading models or camera:', err);
+    systemStatus.textContent = 'Error loading models or camera. Allow camera and reload the page.';
+    startButton.disabled = true;
+  }
+}
+
+// Controls
+startButton.addEventListener('click', () => {
+  if (interviewRunning) return;
+  interviewRunning = true;
+  eventLog = [];
+  startTime = Date.now();
+  logContainer.innerHTML = '';
+  startButton.disabled = true;
+  stopButton.disabled = false;
+  startButton.innerText = 'Proctoring...';
+  logEvent('System', 'Proctoring started.');
+  requestAnimationFrame(detectLoop);
+});
+
+stopButton.addEventListener('click', () => {
+  if (!interviewRunning) return;
+  interviewRunning = false;
+  startButton.disabled = false;
+  stopButton.disabled = true;
+  startButton.innerText = 'Start Proctoring';
+  logEvent('System', 'Proctoring ended. Generating report.');
+  generateReport();
+});
+
+function generateReport() {
+  if (!startTime) return;
+  const dur = Math.round((Date.now() - startTime) / 1000);
+  const focusLostCount = eventLog.filter(e => e.type === 'Alert' && e.message.toLowerCase().includes('looking away')).length;
+  const noFaceCount = eventLog.filter(e => e.type === 'Suspicious' && e.message.toLowerCase().includes('no face')).length;
+  const suspiciousItemCount = eventLog.filter(e => e.type === 'Suspicious' && e.message.toLowerCase().includes('detected')).length;
+  const multipleFaceCount = eventLog.filter(e => e.type === 'Suspicious' && e.message.toLowerCase().includes('multiple faces')).length;
+
+  const deductions = (focusLostCount * 2) + (noFaceCount * 5) + (suspiciousItemCount * 10) + (multipleFaceCount * 15);
+  const finalScore = Math.max(0, 100 - deductions);
+
+  reportDetails.innerHTML = `
+    <p><span class="font-bold">Candidate Name:</span> John Doe (Mock)</p>
+    <p><span class="font-bold">Interview Duration:</span> ${Math.floor(dur/60)} min ${dur % 60} sec</p>
+    <hr class="my-2 border-gray-600">
+    <h3 class="font-bold text-lg mt-4">Integrity Violations:</h3>
+    <ul class="list-disc list-inside space-y-1 ml-4">
+      <li><span class="font-semibold">Focus Lost:</span> ${focusLostCount} times</li>
+      <li><span class="font-semibold">Face Absence:</span> ${noFaceCount} times</li>
+      <li><span class="font-semibold">Suspicious Items:</span> ${suspiciousItemCount} times</li>
+      <li><span class="font-semibold">Multiple Faces:</span> ${multipleFaceCount} times</li>
+    </ul>
+    <hr class="my-2 border-gray-600">
+    <h3 class="font-bold text-lg mt-4">Final Score:</h3>
+    <p class="text-3xl font-bold text-green-400">${finalScore}</p>
+  `;
+  proctoringReport.classList.remove('hidden');
+}
+
+window.addEventListener('load', init);
+</script>
+
+</body>
+</html>
