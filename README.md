@@ -1,4 +1,4 @@
-# 🎥 Focus & Object Detection in Video Interviews
+<img width="881" height="281" alt="image" src="https://github.com/user-attachments/assets/e3faa656-57b2-4fee-9898-a2e7995833f6" /># 🎥 Focus & Object Detection in Video Interviews
 
 A lightweight **AI-powered video proctoring system** built with **TensorFlow.js, BlazeFace, and COCO-SSD**.  
 It helps interviewers monitor candidates in real-time during online interviews by detecting focus and unauthorized objects.
@@ -48,14 +48,14 @@ It helps interviewers monitor candidates in real-time during online interviews b
 
 ### 1. Clone the repo
 ```bash
-git clone https://github.com/your-username/proctoring-system.git
+git clone https://github.com/Ayushy21/Focus-Object-Detection-in-Video-Interviews/edit/main/README.md
 cd proctoring-system
 ```
 
 ### 2. Open in VS Code
 - Install the **Live Server** extension (by Ritwick Dey).
 - Right-click `proctoring.html` → **Open with Live Server**.
-- Browser will open at: `http://127.0.0.1:5500/proctoring.html`
+
 
 ### 3. Allow Camera Access
 - When prompted, click **Allow Camera**.
